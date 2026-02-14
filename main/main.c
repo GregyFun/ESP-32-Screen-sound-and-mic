@@ -21,6 +21,7 @@
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
+#include "mp3dec.h"
 
 // Custom font with French accented characters (generated with lv_font_conv)
 LV_FONT_DECLARE(lv_font_montserrat_32_fr);
@@ -733,8 +734,7 @@ static char* google_tts_synthesize(const char *text)
     cJSON_AddItemToObject(root, "voice", voice);
 
     cJSON *audioConfig = cJSON_CreateObject();
-    cJSON_AddStringToObject(audioConfig, "audioEncoding", "LINEAR16");  // PCM audio, no decoder needed!
-    cJSON_AddNumberToObject(audioConfig, "sampleRateHertz", SAMPLE_RATE);
+    cJSON_AddStringToObject(audioConfig, "audioEncoding", "MP3");
     cJSON_AddItemToObject(root, "audioConfig", audioConfig);
 
     char *json_data = cJSON_PrintUnformatted(root);
@@ -826,7 +826,7 @@ static char* google_tts_synthesize(const char *text)
     return audio_content;  // Caller must free
 }
 
-// Simple base64 decode (for MP3 audio from Google TTS)
+// Simple base64 decode
 static size_t base64_decode(const char *input, uint8_t **output)
 {
     static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -866,59 +866,115 @@ static size_t base64_decode(const char *input, uint8_t **output)
     return j;
 }
 
-// Play LINEAR16 (PCM) audio via I2S
-static void play_audio_pcm(const uint8_t *audio_data, size_t audio_len)
+// Decode MP3 data and play via I2S
+static void play_audio_mp3(const uint8_t *mp3_data, size_t mp3_len)
 {
-    if (audio_len == 0 || audio_data == NULL) {
-        ESP_LOGE(TAG, "Invalid audio data");
+    if (mp3_len == 0 || mp3_data == NULL) {
+        ESP_LOGE(TAG, "Invalid MP3 data");
         return;
     }
 
-    // Google TTS LINEAR16 returns a WAV file - skip the 44-byte header
-    size_t wav_header_size = 0;
-    if (audio_len > 44 && memcmp(audio_data, "RIFF", 4) == 0) {
-        wav_header_size = 44;
-        ESP_LOGI(TAG, "WAV header detected, skipping %d bytes", wav_header_size);
-    }
-    const uint8_t *pcm_start = audio_data + wav_header_size;
-    size_t pcm_len = audio_len - wav_header_size;
+    ESP_LOGI(TAG, "Decoding MP3 audio (%d bytes)...", mp3_len);
 
-    ESP_LOGI(TAG, "Playing LINEAR16 audio (%d bytes = %d samples)...",
-             pcm_len, pcm_len / 2);
-
-    // Make a copy of the audio data to apply fade-in/fade-out
-    int16_t *audio_copy = heap_caps_malloc(pcm_len, MALLOC_CAP_SPIRAM);
-    if (audio_copy == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for audio copy");
+    // Initialize Helix MP3 decoder
+    HMP3Decoder decoder = MP3InitDecoder();
+    if (decoder == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize MP3 decoder");
         return;
     }
-    memcpy(audio_copy, pcm_start, pcm_len);
+
+    // Allocate PCM output buffer in PSRAM (MP3 decompresses to ~10x size)
+    // Max estimate: mp3_len * 12 for safety, capped at 2MB
+    size_t pcm_buf_size = mp3_len * 12;
+    if (pcm_buf_size > 2 * 1024 * 1024) pcm_buf_size = 2 * 1024 * 1024;
+    int16_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_SPIRAM);
+    if (pcm_buf == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate PCM buffer (%d bytes)", pcm_buf_size);
+        MP3FreeDecoder(decoder);
+        return;
+    }
+
+    size_t pcm_offset = 0;  // in bytes
+    unsigned char *read_ptr = (unsigned char *)mp3_data;
+    int bytes_left = (int)mp3_len;
+
+    while (bytes_left > 0) {
+        // Find next sync word
+        int offset = MP3FindSyncWord(read_ptr, bytes_left);
+        if (offset < 0) {
+            break;  // No more frames
+        }
+        read_ptr += offset;
+        bytes_left -= offset;
+
+        // Decode one frame
+        short pcm_frame[1152 * 2];  // Max samples per MP3 frame (stereo)
+        int err = MP3Decode(decoder, &read_ptr, &bytes_left, pcm_frame, 0);
+        if (err != ERR_MP3_NONE) {
+            if (err == ERR_MP3_INDATA_UNDERFLOW) {
+                break;  // Not enough data for another frame
+            }
+            ESP_LOGW(TAG, "MP3 decode error %d, skipping frame", err);
+            continue;
+        }
+
+        // Get frame info to know how many samples were decoded
+        MP3FrameInfo info;
+        MP3GetLastFrameInfo(decoder, &info);
+
+        int frame_bytes;
+        if (info.nChans == 2) {
+            // Stereo → convert to mono by averaging
+            int samples_per_chan = info.outputSamps / 2;
+            frame_bytes = samples_per_chan * 2;
+            for (int i = 0; i < samples_per_chan; i++) {
+                int32_t mixed = ((int32_t)pcm_frame[i * 2] + pcm_frame[i * 2 + 1]) / 2;
+                pcm_frame[i] = (short)mixed;
+            }
+        } else {
+            frame_bytes = info.outputSamps * 2;
+        }
+
+        // Copy to PCM buffer
+        if (pcm_offset + frame_bytes <= pcm_buf_size) {
+            memcpy((uint8_t *)pcm_buf + pcm_offset, pcm_frame, frame_bytes);
+            pcm_offset += frame_bytes;
+        } else {
+            ESP_LOGW(TAG, "PCM buffer full, stopping decode");
+            break;
+        }
+    }
+
+    MP3FreeDecoder(decoder);
+
+    size_t pcm_len_total = pcm_offset;
+    int num_samples = pcm_len_total / 2;
+    ESP_LOGI(TAG, "MP3 decoded: %d bytes PCM (%d samples)", pcm_len_total, num_samples);
 
     // Apply fade-in to avoid click/pop at start (first 50ms)
-    const int fade_samples = (SAMPLE_RATE * 50) / 1000;  // 50ms fade-in
-    int num_samples = pcm_len / 2;
+    const int fade_samples = (SAMPLE_RATE * 50) / 1000;
     for (int i = 0; i < fade_samples && i < num_samples; i++) {
-        float factor = (float)i / fade_samples;  // 0.0 to 1.0
-        audio_copy[i] = (int16_t)(audio_copy[i] * factor);
+        float factor = (float)i / fade_samples;
+        pcm_buf[i] = (int16_t)(pcm_buf[i] * factor);
     }
 
     // Apply fade-out to avoid click/pop at end (last 50ms)
     for (int i = 0; i < fade_samples && i < num_samples; i++) {
         int idx = num_samples - 1 - i;
-        float factor = (float)i / fade_samples;  // 0.0 to 1.0
-        audio_copy[idx] = (int16_t)(audio_copy[idx] * factor);
+        float factor = (float)i / fade_samples;
+        pcm_buf[idx] = (int16_t)(pcm_buf[idx] * factor);
     }
 
-    // Play the audio via I2S
+    // Play via I2S
     size_t bytes_written = 0;
-    esp_err_t err = i2s_channel_write(tx_chan, audio_copy, pcm_len, &bytes_written, portMAX_DELAY);
+    esp_err_t i2s_err = i2s_channel_write(tx_chan, pcm_buf, pcm_len_total, &bytes_written, portMAX_DELAY);
 
-    free(audio_copy);
+    free(pcm_buf);
 
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Audio playback complete! (%d bytes written)", bytes_written);
+    if (i2s_err == ESP_OK) {
+        ESP_LOGI(TAG, "MP3 playback complete! (%d bytes written)", bytes_written);
     } else {
-        ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(i2s_err));
     }
 }
 
@@ -933,17 +989,17 @@ static void tts_say(const char *text)
     if (audio_base64) {
         ESP_LOGI(TAG, "TTS API call successful!");
 
-        // Decode base64 to LINEAR16 (PCM) binary
-        uint8_t *pcm_data = NULL;
-        size_t pcm_len = base64_decode(audio_base64, &pcm_data);
+        // Decode base64 to MP3 binary
+        uint8_t *mp3_data = NULL;
+        size_t mp3_len = base64_decode(audio_base64, &mp3_data);
 
-        if (pcm_data && pcm_len > 0) {
-            ESP_LOGI(TAG, "Base64 decoded: %d bytes of LINEAR16 PCM audio", pcm_len);
+        if (mp3_data && mp3_len > 0) {
+            ESP_LOGI(TAG, "Base64 decoded: %d bytes of MP3 audio", mp3_len);
 
-            // Play the audio via I2S
-            play_audio_pcm(pcm_data, pcm_len);
+            // Decode MP3 and play via I2S
+            play_audio_mp3(mp3_data, mp3_len);
 
-            free(pcm_data);
+            free(mp3_data);
         } else {
             ESP_LOGE(TAG, "Failed to decode base64 audio");
         }

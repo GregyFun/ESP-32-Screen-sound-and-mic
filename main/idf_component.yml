@@ -2,3 +2,5 @@
 dependencies:
   lvgl/lvgl:
     version: "^8.3.0"
+  chmorgan/esp-libhelix-mp3:
+    version: "^1.0.3"
