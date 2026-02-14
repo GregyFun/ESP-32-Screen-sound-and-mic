@@ -233,7 +233,7 @@ static void ili9488_init(void)
 
     // Memory Access Control (IPS specific)
     lcd_cmd(0x36);
-    uint8_t madctl[] = {0x28};  // MY=0, MX=1, MV=0, RGB (not BGR for IPS)
+    uint8_t madctl[] = {0x28};  // MV=1, BGR=1 (landscape mode)
     lcd_data(madctl, sizeof(madctl));
 
     // Pixel Format Set - 18bit (CRITICAL for SPI interface!)
