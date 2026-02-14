@@ -29,7 +29,11 @@ static const char *TAG = "S3_DISPLAY";
 
 // Google Cloud TTS Configuration
 #define TTS_API_URL "https://texttospeech.googleapis.com/v1/text:synthesize"
-#define TTS_BUFFER_SIZE (512 * 1024)  // 512KB buffer for TTS audio (PSRAM)
+#define TTS_BUFFER_SIZE (1024 * 1024)  // 1MB buffer for TTS audio (PSRAM)
+
+// RSS News Configuration
+#define RSS_FEED_URL "https://www.francetvinfo.fr/titres.rss"
+#define RSS_BUFFER_SIZE (64 * 1024)  // 64KB buffer for RSS feed (PSRAM)
 
 // WiFi event group
 static EventGroupHandle_t s_wifi_event_group;
@@ -493,7 +497,8 @@ typedef struct {
     int data_len;
 } http_response_t;
 
-// HTTP event handler for TTS
+// HTTP event handler (shared by RSS and TTS)
+// Caller must pre-set response->buffer_len to the desired max size
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     http_response_t *response = (http_response_t *)evt->user_data;
@@ -513,17 +518,21 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             break;
         case HTTP_EVENT_ON_DATA:
             ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-            // Accumulate data in buffer
+            // Accumulate data in buffer (lazy allocation)
             if (response->buffer == NULL) {
-                response->buffer = heap_caps_malloc(TTS_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-                response->buffer_len = TTS_BUFFER_SIZE;
+                response->buffer = heap_caps_malloc(response->buffer_len, MALLOC_CAP_SPIRAM);
                 response->data_len = 0;
+                if (response->buffer == NULL) {
+                    ESP_LOGE(TAG, "Failed to allocate %d bytes in PSRAM", response->buffer_len);
+                    break;
+                }
             }
             if (response->data_len + evt->data_len < response->buffer_len) {
                 memcpy(response->buffer + response->data_len, evt->data, evt->data_len);
                 response->data_len += evt->data_len;
             } else {
-                ESP_LOGE(TAG, "TTS buffer overflow! Need more than %d bytes", response->buffer_len);
+                ESP_LOGE(TAG, "HTTP buffer overflow! %d + %d >= %d",
+                         response->data_len, evt->data_len, response->buffer_len);
             }
             break;
         case HTTP_EVENT_ON_FINISH:
@@ -536,6 +545,170 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             break;
     }
     return ESP_OK;
+}
+
+// Fetch RSS feed via HTTP GET, returns XML string (caller must free)
+static char* fetch_rss_feed(void)
+{
+    ESP_LOGI(TAG, "Fetching RSS feed from %s", RSS_FEED_URL);
+
+    http_response_t response = {
+        .buffer = NULL,
+        .buffer_len = RSS_BUFFER_SIZE,
+        .data_len = 0
+    };
+
+    esp_http_client_config_t config = {
+        .url = RSS_FEED_URL,
+        .event_handler = http_event_handler,
+        .user_data = &response,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 10000,
+        .buffer_size = 4096,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+
+    char *xml_data = NULL;
+
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "RSS HTTP Status = %d, data_len = %d", status_code, response.data_len);
+
+        if (status_code == 200 && response.buffer != NULL && response.data_len > 0) {
+            response.buffer[response.data_len] = '\0';
+            xml_data = response.buffer;  // Transfer ownership to caller
+            response.buffer = NULL;
+        }
+    } else {
+        ESP_LOGE(TAG, "RSS fetch failed: %s", esp_err_to_name(err));
+    }
+
+    if (response.buffer) {
+        free(response.buffer);
+    }
+    esp_http_client_cleanup(client);
+
+    return xml_data;
+}
+
+// Encode a Unicode codepoint as UTF-8, returns number of bytes written
+static int encode_utf8(uint32_t cp, char *out)
+{
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        out[0] = 0xC0 | (cp >> 6);
+        out[1] = 0x80 | (cp & 0x3F);
+        return 2;
+    } else if (cp < 0x10000) {
+        out[0] = 0xE0 | (cp >> 12);
+        out[1] = 0x80 | ((cp >> 6) & 0x3F);
+        out[2] = 0x80 | (cp & 0x3F);
+        return 3;
+    } else {
+        out[0] = 0xF0 | (cp >> 18);
+        out[1] = 0x80 | ((cp >> 12) & 0x3F);
+        out[2] = 0x80 | ((cp >> 6) & 0x3F);
+        out[3] = 0x80 | (cp & 0x3F);
+        return 4;
+    }
+}
+
+// Decode HTML entities in-place (named + numeric: &#xE9; &#233;)
+static void decode_html_entities(char *str)
+{
+    char *src = str;
+    char *dst = str;
+    while (*src) {
+        if (*src == '&') {
+            // Named entities
+            if (strncmp(src, "&amp;", 5) == 0) { *dst++ = '&'; src += 5; }
+            else if (strncmp(src, "&lt;", 4) == 0) { *dst++ = '<'; src += 4; }
+            else if (strncmp(src, "&gt;", 4) == 0) { *dst++ = '>'; src += 4; }
+            else if (strncmp(src, "&quot;", 6) == 0) { *dst++ = '"'; src += 6; }
+            else if (strncmp(src, "&apos;", 6) == 0) { *dst++ = '\''; src += 6; }
+            // Numeric entities: &#xHH; (hex) or &#NNN; (decimal)
+            else if (src[1] == '#') {
+                uint32_t codepoint = 0;
+                char *end = NULL;
+                if (src[2] == 'x' || src[2] == 'X') {
+                    codepoint = strtoul(src + 3, &end, 16);
+                } else {
+                    codepoint = strtoul(src + 2, &end, 10);
+                }
+                if (end != NULL && *end == ';' && codepoint > 0) {
+                    dst += encode_utf8(codepoint, dst);
+                    src = end + 1;  // skip past ';'
+                } else {
+                    *dst++ = *src++;
+                }
+            }
+            else { *dst++ = *src++; }
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
+// Extract title from a specific RSS item by index
+// Returns true if successful, writes title into out_title
+static bool extract_rss_item_title(const char *xml, int target, char *out_title, size_t title_size)
+{
+    // Navigate to the target item
+    const char *p = xml;
+    for (int i = 0; i <= target; i++) {
+        p = strstr(p, "<item>");
+        if (p == NULL) return false;
+        if (i < target) p += 6;
+    }
+
+    // Find the end of this item
+    const char *item_end = strstr(p, "</item>");
+    if (item_end == NULL) return false;
+
+    // Extract <title>
+    const char *title_start = strstr(p, "<title>");
+    if (title_start == NULL || title_start > item_end) return false;
+    title_start += 7;  // skip "<title>"
+
+    // Handle CDATA: <![CDATA[...]]>
+    if (strncmp(title_start, "<![CDATA[", 9) == 0) {
+        title_start += 9;
+        const char *title_end = strstr(title_start, "]]>");
+        if (title_end == NULL || title_end > item_end) return false;
+        size_t len = title_end - title_start;
+        if (len >= title_size) len = title_size - 1;
+        memcpy(out_title, title_start, len);
+        out_title[len] = '\0';
+    } else {
+        const char *title_end = strstr(title_start, "</title>");
+        if (title_end == NULL || title_end > item_end) return false;
+        size_t len = title_end - title_start;
+        if (len >= title_size) len = title_size - 1;
+        memcpy(out_title, title_start, len);
+        out_title[len] = '\0';
+    }
+
+    decode_html_entities(out_title);
+    ESP_LOGI(TAG, "News item #%d: %s", target, out_title);
+    return true;
+}
+
+// Count the number of <item> elements in RSS XML
+static int count_rss_items(const char *xml)
+{
+    int count = 0;
+    const char *p = xml;
+    while ((p = strstr(p, "<item>")) != NULL) {
+        count++;
+        p += 6;
+    }
+    return count;
 }
 
 // Google Cloud TTS: Synthesize speech from text
@@ -576,7 +749,7 @@ static char* google_tts_synthesize(const char *text)
     // Prepare response buffer
     http_response_t response = {
         .buffer = NULL,
-        .buffer_len = 0,
+        .buffer_len = TTS_BUFFER_SIZE,
         .data_len = 0
     };
 
@@ -793,58 +966,78 @@ static void display_and_say(const char *text)
     tts_say(text);
 }
 
-// Proverbes francais (UTF-8 pour le TTS)
-static const char *proverbes[] = {
-    "Qui s\xc3\xa8me le vent, r\xc3\xa9" "colte la temp\xc3\xaate.",
-    "Pierre qui roule n'amasse pas mousse.",
-    "L'habit ne fait pas le moine.",
-    "Petit \xc3\xa0 petit, l'oiseau fait son nid.",
-    "Qui vivra verra.",
-    "Mieux vaut tard que jamais.",
-    "Apr\xc3\xa8s la pluie, le beau temps.",
-    "Chat \xc3\xa9" "chaud\xc3\xa9 craint l'eau froide.",
-    "Tout ce qui brille n'est pas or.",
-    "La nuit porte conseil.",
-    "Il ne faut pas vendre la peau de l'ours avant de l'avoir tu\xc3\xa9.",
-    "Qui ne tente rien n'a rien.",
-    "Les murs ont des oreilles.",
-    "L'app\xc3\xa9tit vient en mangeant.",
-    "Chien qui aboie ne mord pas.",
-    "\xc3\x80 bon chat, bon rat.",
-    "Les bons comptes font les bons amis.",
-    "Un tiens vaut mieux que deux tu l'auras.",
-    "Rira bien qui rira le dernier.",
-    "Rien ne sert de courir, il faut partir \xc3\xa0 point.",
-};
-static const int num_proverbes = sizeof(proverbes) / sizeof(proverbes[0]);
+// Shuffle an array of indices (Fisher-Yates)
+static void shuffle_indices(int *arr, int n)
+{
+    for (int i = n - 1; i > 0; i--) {
+        int j = esp_random() % (i + 1);
+        int tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+    }
+}
 
-// FreeRTOS task for TTS (runs on separate core)
+// FreeRTOS task for news RSS + TTS (runs on separate core)
 static void tts_task(void *pvParameters)
 {
-    // Wait for WiFi to connect before calling TTS
+    // Wait for WiFi to connect before starting
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    ESP_LOGI(TAG, "TTS task started");
+    ESP_LOGI(TAG, "News TTS task started");
 
-    int last_index = -1;
+    char title_buf[512];
+    char *rss_xml = NULL;
+    int *indices = NULL;
+    int item_count = 0;
+    int current_idx = 0;
+
     while (1) {
-        // Pick a random proverb (avoid repeating the same one)
-        int index;
-        do {
-            index = esp_random() % num_proverbes;
-        } while (index == last_index);
-        last_index = index;
+        // Fetch new RSS feed if needed (first time or all items read)
+        if (rss_xml == NULL || current_idx >= item_count) {
+            if (rss_xml) free(rss_xml);
+            if (indices) free(indices);
+            rss_xml = NULL;
+            indices = NULL;
 
-        display_and_say(proverbes[index]);
+            rss_xml = fetch_rss_feed();
+            if (rss_xml != NULL) {
+                item_count = count_rss_items(rss_xml);
+                ESP_LOGI(TAG, "Found %d RSS items, shuffling...", item_count);
 
-        // Wait 30 seconds before next proverb
-        vTaskDelay(pdMS_TO_TICKS(30000));
+                if (item_count > 0) {
+                    indices = malloc(item_count * sizeof(int));
+                    for (int i = 0; i < item_count; i++) indices[i] = i;
+                    shuffle_indices(indices, item_count);
+                    current_idx = 0;
+                }
+            }
+        }
+
+        // Read the next shuffled item
+        if (rss_xml != NULL && indices != NULL && current_idx < item_count) {
+            if (extract_rss_item_title(rss_xml, indices[current_idx], title_buf, sizeof(title_buf))) {
+                display_and_say(title_buf);
+            } else {
+                ESP_LOGW(TAG, "Failed to extract item #%d", indices[current_idx]);
+            }
+            current_idx++;
+        } else {
+            ESP_LOGW(TAG, "No RSS data available");
+            display_and_say("Connexion aux actualit\xc3\xa9s impossible.");
+        }
+
+        // Wait 15 seconds before next news item
+        vTaskDelay(pdMS_TO_TICKS(15000));
     }
 }
 
 // Create UI
 static void create_ui(void)
 {
+    // Dark background on screen
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+
     ui_label = lv_label_create(lv_scr_act());
 
     lv_label_set_text(ui_label, "Chargement...");
@@ -853,9 +1046,9 @@ static void create_ui(void)
 
     lv_obj_set_style_text_font(ui_label, &lv_font_montserrat_32_fr, 0);
     lv_obj_align(ui_label, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_text_color(ui_label, lv_color_hex(0x0000FF), 0);
+    lv_obj_set_style_text_color(ui_label, lv_color_hex(0xEAEAEA), 0);
 
-    ESP_LOGI(TAG, "Hello World UI created");
+    ESP_LOGI(TAG, "News UI created");
 }
 
 void app_main(void)
