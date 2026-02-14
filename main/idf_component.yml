@@ -1,0 +1,4 @@
+## IDF Component Manager Dependencies
+dependencies:
+  lvgl/lvgl:
+    version: "^8.3.0"

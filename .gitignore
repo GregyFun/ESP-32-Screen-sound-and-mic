@@ -1,0 +1,22 @@
+# Credentials - NE JAMAIS COMMITER!
+main/credentials.h
+
+# ESP-IDF build artifacts
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+*.pyc
+
+# IDE / tools
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
